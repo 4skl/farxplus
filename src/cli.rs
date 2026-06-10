@@ -1,4 +1,3 @@
-// src/cli.rs
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -18,7 +17,7 @@ pub enum Commands {
         #[arg(short, long)]
         output: PathBuf,
     },
-    /// Pack a directory into a .far archive
+    /// Pack a directory into a new .far archive
     Pack {
         #[arg(short, long)]
         input_dir: PathBuf,
