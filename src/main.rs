@@ -1,14 +1,17 @@
 mod cli;
-mod app;
 mod far_fmt;
+mod gui;
 
 use clap::Parser;
 use cli::{Cli, Commands};
-use app::FarxPlusApp;
 use far_fmt::{FarArchive, FileSource};
 use std::process;
 
-fn main() -> eframe::Result<()> {
+use gtk4 as gtk;
+use gtk::prelude::*;
+use gio::ApplicationFlags;
+
+fn main() -> glib::ExitCode {
     let cli_args = Cli::parse();
 
     // Route 1: Command Line Interface
@@ -32,8 +35,6 @@ fn main() -> eframe::Result<()> {
             }
             Commands::Pack { input_dir, output } => {
                 println!("🗜️ Packing: {:?} -> {:?}", input_dir, output);
-                
-                // Construct a virtual tree from the directory, then save it
                 let mut archive = FarArchive::new_empty("CLI_Pack.far".to_string());
                 
                 let mut dirs_to_visit = vec![(input_dir.clone(), String::new())];
@@ -60,20 +61,17 @@ fn main() -> eframe::Result<()> {
                 println!("✅ Packing complete!");
             }
         }
-        process::exit(0);
+        return glib::ExitCode::SUCCESS;
     }
 
-    // Route 2: Desktop Application
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 600.0])
-            .with_title("FARxPlus"),
-        ..Default::default()
-    };
+    // Route 2: GTK Desktop Application
+    let app = gtk::Application::builder()
+        .application_id("com.az.farxplus")
+        .flags(ApplicationFlags::empty())
+        .build();
 
-    eframe::run_native(
-        "FARxPlus",
-        options,
-        Box::new(|_cc| Ok(Box::new(FarxPlusApp::default()))),
-    )
+    app.connect_activate(gui::build_ui);
+    
+    // Run the app (passing empty args since CLI was already parsed)
+    app.run_with_args(&Vec::<String>::new())
 }
