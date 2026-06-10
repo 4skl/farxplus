@@ -36,6 +36,7 @@ pub struct FlatNode {
     pub is_dir: bool,
     pub expanded: bool,
     pub size: u32,
+    pub item_count: usize, // NEW: Tracks how many items are in a folder
 }
 
 #[derive(Clone)]
@@ -111,6 +112,16 @@ impl FarArchive {
         }
     }
 
+    // NEW: Immutable getter
+    pub fn get_node(&self, virtual_path: &str) -> Option<&TreeNode> {
+        let parts: Vec<&str> = virtual_path.split('/').filter(|s| !s.is_empty()).collect();
+        let mut current = &self.tree_root;
+        for part in parts {
+            current = current.children.get(part)?;
+        }
+        Some(current)
+    }
+
     pub fn get_node_mut<'a>(&'a mut self, virtual_path: &str) -> Option<&'a mut TreeNode> {
         let parts: Vec<&str> = virtual_path.split('/').filter(|s| !s.is_empty()).collect();
         let mut current = &mut self.tree_root;
@@ -175,6 +186,7 @@ impl FarArchive {
                 is_dir: child.is_dir,
                 expanded: child.expanded,
                 size: child.source.as_ref().map(|s| s.size()).unwrap_or(0),
+                item_count: child.children.len(), // Count items for the UI
             });
             if child.is_dir && child.expanded {
                 self.flatten_recursive(child, &v_path, depth + 1, result);
@@ -262,7 +274,6 @@ impl FarArchive {
         
         while let Some((node, path)) = stack.pop() {
             if !node.is_dir {
-                // If this file OR any of its parent folders are in the selected list, flag it for extraction
                 let is_selected = selected_paths.iter().any(|sel| {
                     path == *sel || path.starts_with(&format!("{}/", sel))
                 });
@@ -281,7 +292,6 @@ impl FarArchive {
         self.extract_leaves(all_leaves, output_dir)
     }
 
-    // Internal helper for Rayon multi-threading
     fn extract_leaves(&self, leaves: Vec<(String, Option<FileSource>)>, output_dir: &Path) -> Result<(), String> {
         leaves.par_iter().try_for_each(|(v_path, source)| -> Result<(), String> {
             let out_path = output_dir.join(v_path);
