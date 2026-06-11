@@ -136,18 +136,18 @@ jobs:
       - name: Set up Flathub Runtimes
         run: |
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-          flatpak install --user -y flathub org.gnome.Sdk//46 org.gnome.Platform//46
-          # Explicitly install the Rust extension so the builder doesn't panic
-          flatpak install --user -y flathub org.freedesktop.Sdk.Extension.rust-stable//23.08
+          # BUMPED to GNOME 47
+          flatpak install --user -y flathub org.gnome.Sdk//47 org.gnome.Platform//47
+          # BUMPED to the 24.08 Rust extension to support Edition 2024
+          flatpak install --user -y flathub org.freedesktop.Sdk.Extension.rust-stable//24.08
 
-      # FIX 3: Re-structured Flatpak Manifest for proper Rust execution
       - name: Generate Flatpak Manifest
         run: |
           cat <<EOF > com.az.FARxPlus.json
           {
             "app-id": "com.az.FARxPlus",
             "runtime": "org.gnome.Platform",
-            "runtime-version": "46",
+            "runtime-version": "47", 
             "sdk": "org.gnome.Sdk",
             "command": "FARxPlus",
             "sdk-extensions": [
