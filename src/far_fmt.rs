@@ -36,7 +36,7 @@ pub struct FlatNode {
     pub is_dir: bool,
     pub expanded: bool,
     pub size: u32,
-    pub item_count: usize, // NEW: Tracks how many items are in a folder
+    pub item_count: usize, 
 }
 
 #[derive(Clone)]
@@ -112,7 +112,6 @@ impl FarArchive {
         }
     }
 
-    // NEW: Immutable getter
     pub fn get_node(&self, virtual_path: &str) -> Option<&TreeNode> {
         let parts: Vec<&str> = virtual_path.split('/').filter(|s| !s.is_empty()).collect();
         let mut current = &self.tree_root;
@@ -160,6 +159,8 @@ impl FarArchive {
             if let Some(next) = current.children.get_mut(*part) { current = next; } else { return false; }
         }
         
+        if current.children.contains_key(new_name) { return false; }
+        
         if let Some(node) = current.children.remove(*parts.last().unwrap()) {
             current.children.insert(new_name.to_string(), node);
             self.is_modified = true;
@@ -168,89 +169,76 @@ impl FarArchive {
         false
     }
 
-    // --- UI Virtualization ---
-
-    pub fn flatten_tree(&self) -> Vec<FlatNode> {
-        let mut result = Vec::new();
-        self.flatten_recursive(&self.tree_root, "", 0, &mut result);
-        result
-    }
-
-    fn flatten_recursive(&self, node: &TreeNode, current_path: &str, depth: usize, result: &mut Vec<FlatNode>) {
-        for (name, child) in &node.children {
-            let v_path = if current_path.is_empty() { name.clone() } else { format!("{}/{}", current_path, name) };
-            result.push(FlatNode {
-                path: v_path.clone(),
-                name: name.clone(),
-                depth,
-                is_dir: child.is_dir,
-                expanded: child.expanded,
-                size: child.source.as_ref().map(|s| s.size()).unwrap_or(0),
-                item_count: child.children.len(), // Count items for the UI
-            });
-            if child.is_dir && child.expanded {
-                self.flatten_recursive(child, &v_path, depth + 1, result);
-            }
-        }
-    }
-
     // --- Saving & Extracting ---
 
     pub fn save_to_disk(&self, output_path: &Path) -> Result<(), String> {
-        let mut out_file = File::create(output_path).map_err(|e| e.to_string())?;
-        out_file.write_all(b"FAR!byAZ").map_err(|e| e.to_string())?;
-        out_file.write_u32::<LittleEndian>(1).map_err(|e| e.to_string())?;
-        let manifest_pos = out_file.stream_position().map_err(|e| e.to_string())?;
-        out_file.write_u32::<LittleEndian>(0).map_err(|e| e.to_string())?;
+        // BUG FIX: Prevent truncating the file we are currently reading from.
+        // We write to a temporary file in the same directory, then rename it upon success.
+        let temp_output_path = output_path.with_extension("tmp_far");
 
-        let mut all_leaves = Vec::new();
-        let mut stack = vec![(&self.tree_root, String::new())];
-        while let Some((node, path)) = stack.pop() {
-            if !node.is_dir { all_leaves.push((path.clone(), node.source.clone())); }
-            for (name, child) in &node.children {
-                let child_path = if path.is_empty() { name.clone() } else { format!("{}/{}", path, name) };
-                stack.push((child, child_path));
-            }
-        }
+        // Scope the file creation so the handle drops before renaming
+        {
+            let mut out_file = File::create(&temp_output_path).map_err(|e| e.to_string())?;
+            out_file.write_all(b"FAR!byAZ").map_err(|e| e.to_string())?;
+            out_file.write_u32::<LittleEndian>(1).map_err(|e| e.to_string())?;
+            let manifest_pos = out_file.stream_position().map_err(|e| e.to_string())?;
+            out_file.write_u32::<LittleEndian>(0).map_err(|e| e.to_string())?;
 
-        let mut manifest_entries = Vec::new();
-        for (v_path, source) in all_leaves {
-            let offset = out_file.stream_position().map_err(|e| e.to_string())? as u32;
-            let mut data = Vec::new();
-
-            if let Some(src) = source {
-                match src {
-                    FileSource::InArchive { original_archive, offset: orig_off, size } => {
-                        let mut f = File::open(&original_archive).map_err(|e| e.to_string())?;
-                        f.seek(SeekFrom::Start(orig_off as u64)).map_err(|e| e.to_string())?;
-                        data.resize(size as usize, 0);
-                        f.read_exact(&mut data).map_err(|e| e.to_string())?;
-                    }
-                    FileSource::OnDisk(disk_path) => {
-                        let mut f = File::open(&disk_path).map_err(|e| e.to_string())?;
-                        f.read_to_end(&mut data).map_err(|e| e.to_string())?;
-                    }
+            let mut all_leaves = Vec::new();
+            let mut stack = vec![(&self.tree_root, String::new())];
+            while let Some((node, path)) = stack.pop() {
+                if !node.is_dir { all_leaves.push((path.clone(), node.source.clone())); }
+                for (name, child) in &node.children {
+                    let child_path = if path.is_empty() { name.clone() } else { format!("{}/{}", path, name) };
+                    stack.push((child, child_path));
                 }
             }
+
+            let mut manifest_entries = Vec::new();
+            for (v_path, source) in all_leaves {
+                let offset = out_file.stream_position().map_err(|e| e.to_string())? as u32;
+                let mut data = Vec::new();
+
+                if let Some(src) = source {
+                    match src {
+                        FileSource::InArchive { original_archive, offset: orig_off, size } => {
+                            let mut f = File::open(&original_archive).map_err(|e| format!("Failed to read archive: {}", e))?;
+                            f.seek(SeekFrom::Start(orig_off as u64)).map_err(|e| e.to_string())?;
+                            data.resize(size as usize, 0);
+                            f.read_exact(&mut data).map_err(|e| format!("Buffer read error on {}: {}", v_path, e))?;
+                        }
+                        FileSource::OnDisk(disk_path) => {
+                            let mut f = File::open(&disk_path).map_err(|e| e.to_string())?;
+                            f.read_to_end(&mut data).map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+                
+                let size = data.len() as u32;
+                out_file.write_all(&data).map_err(|e| e.to_string())?;
+                manifest_entries.push((v_path.replace("/", "\\"), size, offset));
+            }
+
+            let manifest_start = out_file.stream_position().map_err(|e| e.to_string())? as u32;
+            out_file.write_u32::<LittleEndian>(manifest_entries.len() as u32).map_err(|e| e.to_string())?;
             
-            let size = data.len() as u32;
-            out_file.write_all(&data).map_err(|e| e.to_string())?;
-            manifest_entries.push((v_path.replace("/", "\\"), size, offset));
-        }
+            for (filename, size, offset) in manifest_entries {
+                out_file.write_u32::<LittleEndian>(size).map_err(|e| e.to_string())?;
+                out_file.write_u32::<LittleEndian>(size).map_err(|e| e.to_string())?;
+                out_file.write_u32::<LittleEndian>(offset).map_err(|e| e.to_string())?;
+                out_file.write_u32::<LittleEndian>(filename.len() as u32).map_err(|e| e.to_string())?;
+                out_file.write_all(filename.as_bytes()).map_err(|e| e.to_string())?;
+            }
 
-        let manifest_start = out_file.stream_position().map_err(|e| e.to_string())? as u32;
-        out_file.write_u32::<LittleEndian>(manifest_entries.len() as u32).map_err(|e| e.to_string())?;
-        
-        for (filename, size, offset) in manifest_entries {
-            out_file.write_u32::<LittleEndian>(size).map_err(|e| e.to_string())?;
-            out_file.write_u32::<LittleEndian>(size).map_err(|e| e.to_string())?;
-            out_file.write_u32::<LittleEndian>(offset).map_err(|e| e.to_string())?;
-            out_file.write_u32::<LittleEndian>(filename.len() as u32).map_err(|e| e.to_string())?;
-            out_file.write_all(filename.as_bytes()).map_err(|e| e.to_string())?;
-        }
+            out_file.seek(SeekFrom::Start(manifest_pos)).map_err(|e| e.to_string())?;
+            out_file.write_u32::<LittleEndian>(manifest_start).map_err(|e| e.to_string())?;
+        } // out_file is dropped and fully written here
 
-        out_file.seek(SeekFrom::Start(manifest_pos)).map_err(|e| e.to_string())?;
-        out_file.write_u32::<LittleEndian>(manifest_start).map_err(|e| e.to_string())?;
+        // Replace the original file atomically
+        fs::rename(&temp_output_path, output_path).map_err(|e| {
+            let _ = fs::remove_file(&temp_output_path); // Cleanup temp file on failure
+            format!("Failed to finalize save: {}", e)
+        })?;
 
         Ok(())
     }

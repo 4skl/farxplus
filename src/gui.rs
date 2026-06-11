@@ -6,8 +6,7 @@ use gdk4 as gdk;
 use gtk::prelude::*;
 use gtk::{
     Application, ApplicationWindow, Box, Button, HeaderBar, ListBox, Orientation, Paned,
-    ScrolledWindow, TreeStore, TreeView, TreeViewColumn, CellRendererText, Label, SelectionMode,
-    Separator
+    ScrolledWindow, Label, SelectionMode, Separator, SearchEntry
 };
 use gdk::{DragAction, FileList, ContentProvider};
 use std::cell::RefCell;
@@ -15,11 +14,73 @@ use std::rc::Rc;
 use std::path::PathBuf;
 use crate::far_fmt::{FarArchive, FileSource, TreeNode};
 
-// --- App State ---
+// ==========================================
+// ====== CUSTOM GTK4 DATA MODEL ============
+// ==========================================
+
+mod archive_node {
+    use gio;
+    use glib;
+    use glib::subclass::prelude::*;
+    use std::cell::{Cell, RefCell};
+
+    mod imp {
+        use super::*;
+
+        #[derive(Default)]
+        pub struct ArchiveNodeObject {
+            pub name: RefCell<String>,
+            pub size_str: RefCell<String>,
+            pub v_path: RefCell<String>,
+            pub icon: RefCell<String>,
+            pub is_dir: Cell<bool>,
+            pub children: RefCell<Option<gio::ListStore>>,
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for ArchiveNodeObject {
+            const NAME: &'static str = "ArchiveNodeObject";
+            type Type = super::ArchiveNodeObject;
+        }
+
+        impl ObjectImpl for ArchiveNodeObject {}
+    }
+
+    glib::wrapper! {
+        pub struct ArchiveNodeObject(ObjectSubclass<imp::ArchiveNodeObject>);
+    }
+
+    impl ArchiveNodeObject {
+        pub fn new(name: &str, size_str: &str, v_path: &str, icon: &str, is_dir: bool, children: Option<gio::ListStore>) -> Self {
+            let obj: Self = glib::Object::builder().build();
+            let imp = obj.imp();
+            imp.name.replace(name.to_string());
+            imp.size_str.replace(size_str.to_string());
+            imp.v_path.replace(v_path.to_string());
+            imp.icon.replace(icon.to_string());
+            imp.is_dir.set(is_dir);
+            *imp.children.borrow_mut() = children;
+            obj
+        }
+        pub fn name(&self) -> String { self.imp().name.borrow().clone() }
+        pub fn size_str(&self) -> String { self.imp().size_str.borrow().clone() }
+        pub fn v_path(&self) -> String { self.imp().v_path.borrow().clone() }
+        pub fn icon(&self) -> String { self.imp().icon.borrow().clone() }
+        pub fn is_dir(&self) -> bool { self.imp().is_dir.get() }
+        pub fn children(&self) -> Option<gio::ListStore> { self.imp().children.borrow().clone() }
+    }
+}
+use archive_node::ArchiveNodeObject;
+
+// ==========================================
+// ============= APP STATE ==================
+// ==========================================
+
 struct AppState {
     archives: Vec<FarArchive>,
     active_idx: Option<usize>,
     last_browsed_dir: Option<PathBuf>,
+    search_query: String,
 }
 
 impl AppState {
@@ -32,26 +93,31 @@ impl AppState {
     }
 
     fn add_disk_item(&mut self, idx: usize, disk_path: PathBuf, virtual_parent: &str) {
+        let filename = match disk_path.file_name() {
+            Some(name) => name.to_string_lossy().to_string(),
+            None => return, 
+        };
+
         if disk_path.is_dir() {
             if let Ok(entries) = std::fs::read_dir(&disk_path) {
-                let folder_name = disk_path.file_name().unwrap().to_string_lossy();
-                let new_parent = if virtual_parent.is_empty() { folder_name.to_string() } else { format!("{}/{}", virtual_parent, folder_name) };
+                let new_parent = if virtual_parent.is_empty() { filename } else { format!("{}/{}", virtual_parent, filename) };
                 for entry in entries.flatten() {
                     self.add_disk_item(idx, entry.path(), &new_parent);
                 }
             }
         } else {
-            let filename = disk_path.file_name().unwrap().to_string_lossy();
-            let v_path = if virtual_parent.is_empty() { filename.to_string() } else { format!("{}/{}", virtual_parent, filename) };
+            let v_path = if virtual_parent.is_empty() { filename } else { format!("{}/{}", virtual_parent, filename) };
             FarArchive::insert_node(&mut self.archives[idx].tree_root, &v_path, FileSource::OnDisk(disk_path));
             self.archives[idx].is_modified = true;
         }
     }
 }
 
-// --- UI Sync Helpers ---
+// ==========================================
+// ============ UI SYNC HELPERS =============
+// ==========================================
+
 fn refresh_workspace(listbox: &ListBox, state: &AppState) {
-    // FIX: Safely loop and remove children for GTK 4.10 compatibility
     while let Some(child) = listbox.first_child() {
         listbox.remove(&child);
     }
@@ -72,49 +138,72 @@ fn refresh_workspace(listbox: &ListBox, state: &AppState) {
     }
 }
 
-fn populate_tree_store(store: &TreeStore, parent_iter: Option<&gtk::TreeIter>, node: &TreeNode, path: &str) {
+fn build_list_store(node: &TreeNode, path: &str, query: &str) -> Option<gio::ListStore> {
+    let store = gio::ListStore::new::<ArchiveNodeObject>();
+    let mut has_match = false;
+    
     for (name, child) in &node.children {
         let v_path = if path.is_empty() { name.clone() } else { format!("{}/{}", path, name) };
+        let matches_query = query.is_empty() || name.to_lowercase().contains(&query.to_lowercase());
+        
         let icon = if child.is_dir { "📁" } else { "📄" };
-        let display_name = format!("{} {}", icon, name);
         let size_str = if child.is_dir { String::new() } else { format!("{} B", child.source.as_ref().map(|s| s.size()).unwrap_or(0)) };
         
-        let iter = store.insert_with_values(parent_iter, None, &[(0, &display_name), (1, &size_str), (2, &v_path)]);
-        if child.is_dir { populate_tree_store(store, Some(&iter), child, &v_path); }
+        let child_store = if child.is_dir { build_list_store(child, &v_path, query) } else { None };
+        let children_match = child_store.is_some() && child_store.as_ref().unwrap().n_items() > 0;
+
+        if query.is_empty() || matches_query || children_match {
+            let obj = ArchiveNodeObject::new(name, &size_str, &v_path, icon, child.is_dir, child_store);
+            store.append(&obj);
+            has_match = true;
+        }
     }
+    
+    if has_match { Some(store) } else { None }
 }
 
-fn refresh_tree(tree_store: &TreeStore, state: &AppState) {
-    tree_store.clear();
+fn refresh_tree(root_store: &gio::ListStore, state: &AppState) {
+    root_store.remove_all();
     if let Some(idx) = state.active_idx {
-        populate_tree_store(tree_store, None, &state.archives[idx].tree_root, "");
+        if let Some(store) = build_list_store(&state.archives[idx].tree_root, "", &state.search_query) {
+            for i in 0..store.n_items() {
+                if let Some(item) = store.item(i) {
+                    root_store.append(&item);
+                }
+            }
+        }
     }
 }
 
-fn get_target_dir(tree_view: &TreeView) -> String {
-    let selection = tree_view.selection();
-    let (paths, model) = selection.selected_rows();
-    if paths.is_empty() { return String::new(); }
-    
-    let iter = model.iter(&paths[0]).unwrap();
-    let v_path: String = model.get_value(&iter, 2).get().unwrap();
-    
-    let display_name: String = model.get_value(&iter, 0).get().unwrap();
-    if display_name.contains("📁") { v_path } 
-    else { v_path.rsplit_once('/').map(|(p, _)| p.to_string()).unwrap_or_default() }
+fn get_selected_object(selection_model: &gtk::SingleSelection) -> Option<ArchiveNodeObject> {
+    let item = selection_model.selected_item()?;
+    let list_row = item.downcast::<gtk::TreeListRow>().ok()?;
+    list_row.item()?.downcast::<ArchiveNodeObject>().ok()
 }
 
-// --- Main UI Builder ---
+fn get_target_dir(selection_model: &gtk::SingleSelection) -> String {
+    if let Some(obj) = get_selected_object(selection_model) {
+        let v_path = obj.v_path();
+        if obj.is_dir() { return v_path; } 
+        else { return v_path.rsplit_once('/').map(|(p, _)| p.to_string()).unwrap_or_default(); }
+    }
+    String::new()
+}
+
+// ==========================================
+// ============ MAIN UI BUILDER =============
+// ==========================================
+
 pub fn build_ui(app: &Application) {
     let state = Rc::new(RefCell::new(AppState {
         archives: Vec::new(),
         active_idx: None,
         last_browsed_dir: None,
+        search_query: String::new(),
     }));
 
     let window = ApplicationWindow::builder().application(app).title("FARxPlus").default_width(1000).default_height(700).build();
 
-    // --- Header Bar ---
     let header_bar = HeaderBar::new();
     window.set_titlebar(Some(&header_bar));
 
@@ -125,12 +214,10 @@ pub fn build_ui(app: &Application) {
     header_bar.pack_start(&btn_open);
     header_bar.pack_end(&btn_save);
 
-    // --- Layout ---
     let main_vbox = Box::new(Orientation::Vertical, 0);
     let paned = Paned::builder().orientation(Orientation::Horizontal).position(250).vexpand(true).build();
     let status_label = Label::builder().label("Ready").halign(gtk::Align::Start).margin_start(10).margin_top(5).margin_bottom(5).build();
 
-    // --- Workspace (Left) ---
     let left_vbox = Box::new(Orientation::Vertical, 0);
     left_vbox.append(&Label::builder().label("Workspace").margin_top(10).margin_bottom(10).build());
     left_vbox.append(&Separator::new(Orientation::Horizontal));
@@ -148,7 +235,6 @@ pub fn build_ui(app: &Application) {
     left_vbox.append(&btn_close_archive);
     paned.set_start_child(Some(&left_vbox));
 
-    // --- Virtual Tree (Right) ---
     let right_vbox = Box::new(Orientation::Vertical, 0);
     
     let toolbar = Box::new(Orientation::Horizontal, 5);
@@ -160,33 +246,109 @@ pub fn build_ui(app: &Application) {
     let btn_extract = Button::with_label("📥 Extract Selected");
     let btn_add_files = Button::with_label("➕ Add Files");
     let btn_add_folder = Button::with_label("📁 Add Folder");
+    let btn_rename = Button::with_label("✏️ Rename"); 
     let btn_delete = Button::with_label("🗑 Delete");
     toolbar.append(&btn_extract);
     toolbar.append(&btn_add_files);
     toolbar.append(&btn_add_folder);
     toolbar.append(&Separator::new(Orientation::Vertical));
+    toolbar.append(&btn_rename);
     toolbar.append(&btn_delete);
     right_vbox.append(&toolbar);
 
-    let tree_store = TreeStore::new(&[glib::Type::STRING, glib::Type::STRING, glib::Type::STRING]);
-    let tree_view = TreeView::builder().model(&tree_store).headers_visible(true).vexpand(true).build();
+    let search_bar = SearchEntry::new();
+    search_bar.set_placeholder_text(Some("Search files..."));
+    search_bar.set_margin_start(5);
+    search_bar.set_margin_end(5);
+    search_bar.set_margin_bottom(5);
+    right_vbox.append(&search_bar);
 
-    let name_col = TreeViewColumn::new();
-    name_col.set_title("Name");
-    let name_cell = CellRendererText::new();
-    name_cell.set_editable(true); 
-    name_col.pack_start(&name_cell, true);
-    name_col.add_attribute(&name_cell, "text", 0);
-    tree_view.append_column(&name_col);
+    // ==========================================
+    // ====== MODERN COLUMNVIEW SETUP ===========
+    // ==========================================
+    let root_store = gio::ListStore::new::<ArchiveNodeObject>();
+    
+    let tree_list_model = gtk::TreeListModel::new(
+        root_store.clone(),
+        false, 
+        false, 
+        |item| {
+            let obj = item.downcast_ref::<ArchiveNodeObject>().unwrap();
+            obj.children().map(|s| s.upcast::<gio::ListModel>())
+        }
+    );
 
-    let size_col = TreeViewColumn::new();
-    size_col.set_title("Size");
-    let size_cell = CellRendererText::new();
-    size_col.pack_start(&size_cell, false);
-    size_col.add_attribute(&size_cell, "text", 1);
-    tree_view.append_column(&size_col);
+    let selection_model = gtk::SingleSelection::new(Some(tree_list_model));
+    let column_view = gtk::ColumnView::new(Some(selection_model.clone()));
 
-    let right_scroll = ScrolledWindow::builder().child(&tree_view).build();
+    // Column 1: Name & Icon
+    let factory_name = gtk::SignalListItemFactory::new();
+    factory_name.connect_setup(|_, obj| {
+        let list_item = obj.downcast_ref::<gtk::ListItem>().unwrap();
+        let expander = gtk::TreeExpander::new();
+        let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 6); // 6px gap between icon and text
+        
+        // UX FIX: Add vertical padding to make the row taller. 
+        // A taller row forces the expander arrow to generate a much larger, easier-to-click hitbox!
+        box_.set_margin_top(4);
+        box_.set_margin_bottom(4);
+
+        let icon_label = gtk::Label::new(None);
+        let name_label = gtk::Label::new(None);
+        
+        // Prevent extremely long file names from stretching the window horizontally
+        name_label.set_ellipsize(gtk::pango::EllipsizeMode::End); 
+        
+        box_.append(&icon_label);
+        box_.append(&name_label);
+        expander.set_child(Some(&box_));
+        list_item.set_child(Some(&expander));
+    });
+    
+    factory_name.connect_bind(|_, obj| {
+        let list_item = obj.downcast_ref::<gtk::ListItem>().unwrap();
+        let expander = list_item.child().unwrap().downcast::<gtk::TreeExpander>().unwrap();
+        let list_row = list_item.item().unwrap().downcast::<gtk::TreeListRow>().unwrap();
+        expander.set_list_row(Some(&list_row)); 
+        
+        let item_obj = list_row.item().unwrap().downcast::<ArchiveNodeObject>().unwrap();
+        let box_ = expander.child().unwrap().downcast::<gtk::Box>().unwrap();
+        let icon_label = box_.first_child().unwrap().downcast::<gtk::Label>().unwrap();
+        let name_label = icon_label.next_sibling().unwrap().downcast::<gtk::Label>().unwrap();
+        
+        icon_label.set_text(&item_obj.icon());
+        name_label.set_text(&item_obj.name());
+    });
+    
+    let col_name = gtk::ColumnViewColumn::new(Some("Name"), Some(factory_name));
+    col_name.set_expand(true);
+    column_view.append_column(&col_name);
+
+    // Column 2: Size
+    let factory_size = gtk::SignalListItemFactory::new();
+    factory_size.connect_setup(|_, obj| {
+        let list_item = obj.downcast_ref::<gtk::ListItem>().unwrap();
+        let label = gtk::Label::builder().halign(gtk::Align::Start).build();
+        list_item.set_child(Some(&label));
+    });
+    
+    factory_size.connect_bind(|_, obj| {
+        let list_item = obj.downcast_ref::<gtk::ListItem>().unwrap();
+        let label = list_item.child().unwrap().downcast::<gtk::Label>().unwrap();
+        let list_row = list_item.item().unwrap().downcast::<gtk::TreeListRow>().unwrap();
+        let item_obj = list_row.item().unwrap().downcast::<ArchiveNodeObject>().unwrap();
+        label.set_text(&item_obj.size_str());
+    });
+
+    let col_size = gtk::ColumnViewColumn::new(Some("Size"), Some(factory_size));
+    column_view.append_column(&col_size);
+
+    // HEIGHT FIX: Add .vexpand(true) so the window stretches to fill the screen
+    let right_scroll = ScrolledWindow::builder()
+        .child(&column_view)
+        .vexpand(true) 
+        .build();
+    
     right_vbox.append(&right_scroll);
     paned.set_end_child(Some(&right_vbox));
 
@@ -199,38 +361,54 @@ pub fn build_ui(app: &Application) {
     // ============ SIGNAL HANDLERS =============
     // ==========================================
 
-    // --- 1. Workspace Selection ---
-    let state_list = state.clone();
-    let tree_store_list = tree_store.clone();
-    archive_list.connect_row_selected(move |_, row| {
-        if let Some(r) = row {
-            // FIX: try_borrow_mut prevents panic when GTK fires this programmatically
-            if let Ok(mut s) = state_list.try_borrow_mut() {
-                s.active_idx = Some(r.index() as usize);
-                refresh_tree(&tree_store_list, &s);
+    column_view.connect_activate(|view, position| {
+        let selection = view.model().unwrap().downcast::<gtk::SingleSelection>().unwrap();
+        if let Some(item) = selection.item(position) {
+            if let Ok(row) = item.downcast::<gtk::TreeListRow>() {
+                row.set_expanded(!row.is_expanded());
             }
         }
     });
 
-    // --- 2. New Archive ---
-    let state_new = state.clone();
-    let list_new = archive_list.clone();
-    let tree_new = tree_store.clone();
-    let status_new = status_label.clone();
-    btn_new.connect_clicked(move |_| {
-        let mut s = state_new.borrow_mut();
-        s.archives.push(FarArchive::new_empty("New_Archive.far".to_string()));
-        s.active_idx = Some(s.archives.len() - 1);
-        refresh_workspace(&list_new, &s);
-        refresh_tree(&tree_new, &s);
-        status_new.set_label("Created New Archive.");
+    let state_search = state.clone();
+    let root_store_search = root_store.clone();
+    search_bar.connect_search_changed(move |entry| {
+        let text = entry.text().to_string();
+        if let Ok(mut s) = state_search.try_borrow_mut() {
+            s.search_query = text;
+            refresh_tree(&root_store_search, &s);
+        }
     });
 
-    // --- 3. Open Archive ---
+    let state_list = state.clone();
+    let root_store_list = root_store.clone();
+    archive_list.connect_row_selected(move |_, row| {
+        if let Some(r) = row {
+            if let Ok(mut s) = state_list.try_borrow_mut() {
+                s.active_idx = Some(r.index() as usize);
+                refresh_tree(&root_store_list, &s);
+            }
+        }
+    });
+
+    let state_new = state.clone();
+    let list_new = archive_list.clone();
+    let root_store_new = root_store.clone();
+    let status_new = status_label.clone();
+    btn_new.connect_clicked(move |_| {
+        if let Ok(mut s) = state_new.try_borrow_mut() {
+            s.archives.push(FarArchive::new_empty("New_Archive.far".to_string()));
+            s.active_idx = Some(s.archives.len() - 1);
+            refresh_workspace(&list_new, &s);
+            refresh_tree(&root_store_new, &s);
+            status_new.set_label("Created New Archive.");
+        }
+    });
+
     let state_open = state.clone();
     let window_open = window.clone();
     let list_open = archive_list.clone();
-    let tree_open = tree_store.clone();
+    let root_store_open = root_store.clone();
     let status_open = status_label.clone();
     btn_open.connect_clicked(move |_| {
         let dialog = gtk::FileDialog::new();
@@ -247,27 +425,27 @@ pub fn build_ui(app: &Application) {
 
         let state_cb = state_open.clone();
         let list_cb = list_open.clone();
-        let tree_cb = tree_open.clone();
+        let root_store_cb = root_store_open.clone();
         let status_cb = status_open.clone();
         
         dialog.open(Some(&window_open), gio::Cancellable::NONE, move |res| {
             if let Ok(file) = res {
                 if let Some(path) = file.path() {
-                    let mut s = state_cb.borrow_mut();
-                    s.update_last_dir(&path);
-                    if let Ok(archive) = FarArchive::open(&path) {
-                        s.archives.push(archive);
-                        s.active_idx = Some(s.archives.len() - 1);
-                        refresh_workspace(&list_cb, &s);
-                        refresh_tree(&tree_cb, &s);
-                        status_cb.set_label(&format!("Loaded {:?}", path.file_name().unwrap()));
+                    if let Ok(mut s) = state_cb.try_borrow_mut() {
+                        s.update_last_dir(&path);
+                        if let Ok(archive) = FarArchive::open(&path) {
+                            s.archives.push(archive);
+                            s.active_idx = Some(s.archives.len() - 1);
+                            refresh_workspace(&list_cb, &s);
+                            refresh_tree(&root_store_cb, &s);
+                            status_cb.set_label(&format!("Loaded {:?}", path.file_name().unwrap()));
+                        }
                     }
                 }
             }
         });
     });
 
-    // --- 4. Save As ---
     let state_save = state.clone();
     let window_save = window.clone();
     let list_save = archive_list.clone();
@@ -278,6 +456,7 @@ pub fn build_ui(app: &Application) {
             let dialog = gtk::FileDialog::new();
             dialog.set_initial_name(Some(&s.archives[idx].display_name));
             if let Some(dir) = &s.last_browsed_dir { dialog.set_initial_folder(Some(&gio::File::for_path(dir))); }
+            let archive_clone = s.archives[idx].clone();
             drop(s);
 
             let state_cb = state_save.clone();
@@ -288,69 +467,117 @@ pub fn build_ui(app: &Application) {
                 if let Ok(file) = res {
                     if let Some(mut path) = file.path() {
                         if path.extension().unwrap_or_default() != "far" { path.set_extension("far"); }
-                        let mut s = state_cb.borrow_mut();
-                        s.update_last_dir(&path);
-                        let archive = &mut s.archives[idx];
-                        match archive.save_to_disk(&path) {
-                            Ok(_) => {
-                                archive.is_modified = false;
-                                archive.file_path = Some(path.clone());
-                                archive.display_name = path.file_name().unwrap().to_string_lossy().to_string();
-                                refresh_workspace(&list_cb, &s);
-                                status_cb.set_label("Archive saved successfully.");
+                        if let Ok(mut s) = state_cb.try_borrow_mut() { s.update_last_dir(&path); }
+                        
+                        status_cb.set_label("⏳ Saving archive...");
+                        
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let path_clone = path.clone();
+                        
+                        std::thread::spawn(move || {
+                            let result = archive_clone.save_to_disk(&path_clone);
+                            let _ = tx.send(result);
+                        });
+
+                        let state_cb_timer = state_cb.clone();
+                        let list_cb_timer = list_cb.clone();
+                        let status_cb_timer = status_cb.clone();
+                        let path_timer = path.clone();
+
+                        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                            match rx.try_recv() {
+                                Ok(result) => {
+                                    if let Ok(mut s) = state_cb_timer.try_borrow_mut() {
+                                        if let Some(idx) = s.active_idx {
+                                            match result {
+                                                Ok(_) => {
+                                                    s.archives[idx].is_modified = false;
+                                                    s.archives[idx].file_path = Some(path_timer.clone());
+                                                    s.archives[idx].display_name = path_timer.file_name().unwrap().to_string_lossy().to_string();
+                                                    refresh_workspace(&list_cb_timer, &s);
+                                                    status_cb_timer.set_label("✅ Archive saved successfully.");
+                                                }
+                                                Err(e) => status_cb_timer.set_label(&format!("❌ Save failed: {}", e)),
+                                            }
+                                        }
+                                    }
+                                    glib::ControlFlow::Break
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    status_cb_timer.set_label("❌ Save failed (thread disconnected).");
+                                    glib::ControlFlow::Break
+                                }
                             }
-                            Err(e) => status_cb.set_label(&format!("Save failed: {}", e)),
-                        }
+                        });
                     }
                 }
             });
         }
     });
 
-    // --- 5. Extract ---
     let state_ex = state.clone();
     let window_ex = window.clone();
-    let tree_view_ex = tree_view.clone();
+    let selection_ex = selection_model.clone();
     let status_ex = status_label.clone();
     btn_extract.connect_clicked(move |_| {
         let s = state_ex.borrow();
         if let Some(idx) = s.active_idx {
-            let selection = tree_view_ex.selection();
-            let (paths, model) = selection.selected_rows();
-            if paths.is_empty() { return; }
+            if let Some(obj) = get_selected_object(&selection_ex) {
+                let v_path = obj.v_path();
+                let archive_clone = s.archives[idx].clone();
+                
+                let dialog = gtk::FileDialog::new();
+                dialog.set_title("Extract To...");
+                if let Some(dir) = &s.last_browsed_dir { dialog.set_initial_folder(Some(&gio::File::for_path(dir))); }
+                drop(s);
 
-            let iter = model.iter(&paths[0]).unwrap();
-            let v_path: String = model.get_value(&iter, 2).get().unwrap();
-            
-            let dialog = gtk::FileDialog::new();
-            dialog.set_title("Extract To...");
-            if let Some(dir) = &s.last_browsed_dir { dialog.set_initial_folder(Some(&gio::File::for_path(dir))); }
-            drop(s);
+                let state_cb = state_ex.clone();
+                let status_cb = status_ex.clone();
+                dialog.select_folder(Some(&window_ex), gio::Cancellable::NONE, move |res| {
+                    if let Ok(file) = res {
+                        if let Some(out_dir) = file.path() {
+                            if let Ok(mut s) = state_cb.try_borrow_mut() { s.update_last_dir(&out_dir); }
+                            
+                            status_cb.set_label("⏳ Extracting files...");
+                            let mut set = std::collections::HashSet::new();
+                            set.insert(v_path.clone());
+                            
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let status_thread_cb = status_cb.clone();
+                            
+                            std::thread::spawn(move || {
+                                let result = archive_clone.extract_items(&set, &out_dir);
+                                let _ = tx.send(result);
+                            });
 
-            let state_cb = state_ex.clone();
-            let status_cb = status_ex.clone();
-            dialog.select_folder(Some(&window_ex), gio::Cancellable::NONE, move |res| {
-                if let Ok(file) = res {
-                    if let Some(out_dir) = file.path() {
-                        let mut s = state_cb.borrow_mut();
-                        s.update_last_dir(&out_dir);
-                        let mut set = std::collections::HashSet::new();
-                        set.insert(v_path.clone());
-                        match s.archives[idx].extract_items(&set, &out_dir) {
-                            Ok(_) => status_cb.set_label("Extraction complete!"),
-                            Err(e) => status_cb.set_label(&format!("Extracted failed: {}", e)),
+                            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                                match rx.try_recv() {
+                                    Ok(result) => {
+                                        match result {
+                                            Ok(_) => status_thread_cb.set_label("✅ Extraction complete!"),
+                                            Err(e) => status_thread_cb.set_label(&format!("❌ Extract failed: {}", e)),
+                                        }
+                                        glib::ControlFlow::Break
+                                    }
+                                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                        status_thread_cb.set_label("❌ Extract failed (thread disconnected).");
+                                        glib::ControlFlow::Break
+                                    }
+                                }
+                            });
                         }
                     }
-                }
-            });
+                });
+            }
         }
     });
 
-    // --- 6. Add Files & Folders ---
-    let setup_add_dialog = |is_folder: bool, window: &ApplicationWindow, tree: &TreeView, state: &Rc<RefCell<AppState>>, list: &ListBox, store: &TreeStore, status: &Label| {
+    let setup_add_dialog = |is_folder: bool, window: &ApplicationWindow, sel_model: &gtk::SingleSelection, state: &Rc<RefCell<AppState>>, list: &ListBox, store: &gio::ListStore, status: &Label| {
         let s = state.borrow();
         if s.active_idx.is_none() { return; }
-        let target_dir = get_target_dir(tree);
+        let target_dir = get_target_dir(sel_model);
         
         let dialog = gtk::FileDialog::new();
         if let Some(dir) = &s.last_browsed_dir { dialog.set_initial_folder(Some(&gio::File::for_path(dir))); }
@@ -365,13 +592,14 @@ pub fn build_ui(app: &Application) {
             dialog.select_folder(Some(window), gio::Cancellable::NONE, move |res| {
                 if let Ok(file) = res {
                     if let Some(path) = file.path() {
-                        let mut s = state_cb.borrow_mut();
-                        let idx = s.active_idx.unwrap();
-                        s.update_last_dir(&path);
-                        s.add_disk_item(idx, path, &target_dir);
-                        refresh_workspace(&list_cb, &s);
-                        refresh_tree(&store_cb, &s);
-                        status_cb.set_label("Folder added.");
+                        if let Ok(mut s) = state_cb.try_borrow_mut() {
+                            let idx = s.active_idx.unwrap();
+                            s.update_last_dir(&path);
+                            s.add_disk_item(idx, path, &target_dir);
+                            refresh_workspace(&list_cb, &s);
+                            refresh_tree(&store_cb, &s);
+                            status_cb.set_label("Folder added.");
+                        }
                     }
                 }
             });
@@ -379,146 +607,183 @@ pub fn build_ui(app: &Application) {
             dialog.open(Some(window), gio::Cancellable::NONE, move |res| {
                 if let Ok(file) = res {
                     if let Some(path) = file.path() {
-                        let mut s = state_cb.borrow_mut();
-                        let idx = s.active_idx.unwrap();
-                        s.update_last_dir(&path);
-                        s.add_disk_item(idx, path, &target_dir);
-                        refresh_workspace(&list_cb, &s);
-                        refresh_tree(&store_cb, &s);
-                        status_cb.set_label("File added.");
+                        if let Ok(mut s) = state_cb.try_borrow_mut() {
+                            let idx = s.active_idx.unwrap();
+                            s.update_last_dir(&path);
+                            s.add_disk_item(idx, path, &target_dir);
+                            refresh_workspace(&list_cb, &s);
+                            refresh_tree(&store_cb, &s);
+                            status_cb.set_label("File added.");
+                        }
                     }
                 }
             });
         }
     };
 
-    let w_clone1 = window.clone(); let t_clone1 = tree_view.clone(); let st_clone1 = state.clone(); let l_clone1 = archive_list.clone(); let str_clone1 = tree_store.clone(); let stat_clone1 = status_label.clone();
-    btn_add_files.connect_clicked(move |_| setup_add_dialog(false, &w_clone1, &t_clone1, &st_clone1, &l_clone1, &str_clone1, &stat_clone1));
+    let w_clone1 = window.clone(); let sel_clone1 = selection_model.clone(); let st_clone1 = state.clone(); let l_clone1 = archive_list.clone(); let r_clone1 = root_store.clone(); let stat_clone1 = status_label.clone();
+    btn_add_files.connect_clicked(move |_| setup_add_dialog(false, &w_clone1, &sel_clone1, &st_clone1, &l_clone1, &r_clone1, &stat_clone1));
     
-    let w_clone2 = window.clone(); let t_clone2 = tree_view.clone(); let st_clone2 = state.clone(); let l_clone2 = archive_list.clone(); let str_clone2 = tree_store.clone(); let stat_clone2 = status_label.clone();
-    btn_add_folder.connect_clicked(move |_| setup_add_dialog(true, &w_clone2, &t_clone2, &st_clone2, &l_clone2, &str_clone2, &stat_clone2));
+    let w_clone2 = window.clone(); let sel_clone2 = selection_model.clone(); let st_clone2 = state.clone(); let l_clone2 = archive_list.clone(); let r_clone2 = root_store.clone(); let stat_clone2 = status_label.clone();
+    btn_add_folder.connect_clicked(move |_| setup_add_dialog(true, &w_clone2, &sel_clone2, &st_clone2, &l_clone2, &r_clone2, &stat_clone2));
 
-    // --- 7. Delete Item ---
     let state_del = state.clone();
-    let tree_view_del = tree_view.clone();
+    let selection_del = selection_model.clone();
     let list_del = archive_list.clone();
-    let tree_store_del = tree_store.clone();
+    let root_store_del = root_store.clone();
     btn_delete.connect_clicked(move |_| {
-        let selection = tree_view_del.selection();
-        let (paths, model) = selection.selected_rows();
-        if paths.is_empty() { return; }
-
-        let iter = model.iter(&paths[0]).unwrap();
-        let v_path: String = model.get_value(&iter, 2).get().unwrap();
-        
-        let mut s = state_del.borrow_mut();
-        if let Some(idx) = s.active_idx {
-            s.archives[idx].remove_node(&v_path);
-            refresh_workspace(&list_del, &s);
-            refresh_tree(&tree_store_del, &s);
+        if let Some(obj) = get_selected_object(&selection_del) {
+            let v_path = obj.v_path();
+            if let Ok(mut s) = state_del.try_borrow_mut() {
+                if let Some(idx) = s.active_idx {
+                    s.archives[idx].remove_node(&v_path);
+                    refresh_workspace(&list_del, &s);
+                    refresh_tree(&root_store_del, &s);
+                }
+            }
         }
     });
 
-    // --- 8. Rename Item (Native Cell Editing) ---
     let state_ren = state.clone();
+    let window_ren = window.clone();
+    let selection_ren = selection_model.clone();
     let list_ren = archive_list.clone();
-    let tree_store_ren = tree_store.clone();
-    name_cell.connect_edited(move |_, tree_path, new_name| {
-        if new_name.trim().is_empty() { return; }
-        
-        let iter = tree_store_ren.iter(&tree_path).unwrap();
-        let v_path: String = tree_store_ren.get_value(&iter, 2).get().unwrap();
-        
-        let mut s = state_ren.borrow_mut();
-        if let Some(idx) = s.active_idx {
-            let clean_name = new_name.replace("📁 ", "").replace("📄 ", "");
-            s.archives[idx].rename_node(&v_path, &clean_name);
-            refresh_workspace(&list_ren, &s);
-            refresh_tree(&tree_store_ren, &s);
+    let root_store_ren = root_store.clone();
+    
+    btn_rename.connect_clicked(move |_| {
+        if let Some(obj) = get_selected_object(&selection_ren) {
+            let v_path = obj.v_path();
+            let current_name = obj.name();
+
+            let dialog = gtk::Window::builder()
+                .title("Rename")
+                .modal(true)
+                .transient_for(&window_ren)
+                .default_width(300)
+                .build();
+
+            let vbox = gtk::Box::new(gtk::Orientation::Vertical, 10);
+            vbox.set_margin_start(10); vbox.set_margin_end(10);
+            vbox.set_margin_top(10); vbox.set_margin_bottom(10);
+
+            let entry = gtk::Entry::new();
+            entry.set_text(&current_name);
+            vbox.append(&entry);
+
+            let btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+            btn_box.set_halign(gtk::Align::End);
+            let btn_cancel = gtk::Button::with_label("Cancel");
+            let btn_ok = gtk::Button::with_label("Rename");
+            btn_box.append(&btn_cancel);
+            btn_box.append(&btn_ok);
+            vbox.append(&btn_box);
+
+            dialog.set_child(Some(&vbox));
+
+            let d_clone1 = dialog.clone();
+            btn_cancel.connect_clicked(move |_| d_clone1.destroy());
+
+            let d_clone2 = dialog.clone();
+            let state_ok = state_ren.clone();
+            let list_ok = list_ren.clone();
+            let root_ok = root_store_ren.clone();
+            
+            btn_ok.connect_clicked(move |_| {
+                let new_name = entry.text().to_string();
+                if !new_name.trim().is_empty() {
+                    if let Ok(mut s) = state_ok.try_borrow_mut() {
+                        if let Some(idx) = s.active_idx {
+                            if s.archives[idx].rename_node(&v_path, &new_name) {
+                                refresh_workspace(&list_ok, &s);
+                                refresh_tree(&root_ok, &s);
+                            }
+                        }
+                    }
+                }
+                d_clone2.destroy();
+            });
+
+            dialog.present();
         }
     });
 
-    // --- 9. Close Active Archive ---
     let state_close = state.clone();
     let list_close = archive_list.clone();
-    let tree_close = tree_store.clone();
+    let root_store_close = root_store.clone();
     let status_close = status_label.clone();
     btn_close_archive.connect_clicked(move |_| {
-        let mut s = state_close.borrow_mut();
-        if let Some(idx) = s.active_idx {
-            s.archives.remove(idx);
-            s.active_idx = if s.archives.is_empty() { None } else { Some(0) };
-            refresh_workspace(&list_close, &s);
-            refresh_tree(&tree_close, &s);
-            status_close.set_label("Archive closed.");
+        if let Ok(mut s) = state_close.try_borrow_mut() {
+            if let Some(idx) = s.active_idx {
+                s.archives.remove(idx);
+                s.active_idx = if s.archives.is_empty() { None } else { Some(0) };
+                refresh_workspace(&list_close, &s);
+                refresh_tree(&root_store_close, &s);
+                status_close.set_label("Archive closed.");
+            }
         }
     });
 
-    // --- 10. Drag & Drop ---
     let drop_target = gtk::DropTarget::new(FileList::static_type(), DragAction::COPY);
     let state_drop = state.clone();
     let list_drop = archive_list.clone();
-    let tree_store_drop = tree_store.clone();
+    let root_store_drop = root_store.clone();
     let status_drop = status_label.clone();
-    let tree_view_drop = tree_view.clone();
+    let selection_drop = selection_model.clone();
     
     drop_target.connect_drop(move |_, value: &glib::Value, _x: f64, _y: f64| -> bool {
         if let Ok(file_list) = value.get::<FileList>() {
-            let mut s = state_drop.borrow_mut();
-            let target_dir = get_target_dir(&tree_view_drop);
-            let files: Vec<gio::File> = file_list.files(); 
-            for file in files {
-                let opt_path: Option<PathBuf> = file.path();
-                if let Some(path) = opt_path {
-                    if path.extension().is_some_and(|ext| ext == "far") {
-                        if let Ok(archive) = FarArchive::open(&path) {
-                            s.archives.push(archive);
-                            s.active_idx = Some(s.archives.len() - 1);
-                            status_drop.set_label("Loaded Dropped Archive.");
+            if let Ok(mut s) = state_drop.try_borrow_mut() {
+                let target_dir = get_target_dir(&selection_drop);
+                let files: Vec<gio::File> = file_list.files(); 
+                for file in files {
+                    let opt_path: Option<PathBuf> = file.path();
+                    if let Some(path) = opt_path {
+                        if path.extension().is_some_and(|ext| ext == "far") {
+                            if let Ok(archive) = FarArchive::open(&path) {
+                                s.archives.push(archive);
+                                s.active_idx = Some(s.archives.len() - 1);
+                                status_drop.set_label("Loaded Dropped Archive.");
+                            }
+                        } else if let Some(idx) = s.active_idx {
+                            s.add_disk_item(idx, path, &target_dir);
+                            status_drop.set_label("Added dropped items.");
                         }
-                    } else if let Some(idx) = s.active_idx {
-                        s.add_disk_item(idx, path, &target_dir);
-                        status_drop.set_label("Added dropped items.");
                     }
                 }
+                refresh_workspace(&list_drop, &s);
+                refresh_tree(&root_store_drop, &s);
+                return true;
             }
-            refresh_workspace(&list_drop, &s);
-            refresh_tree(&tree_store_drop, &s);
-            return true;
         }
         false
     });
     window.add_controller(drop_target);
 
-    // Exporting Drag out
     let drag_source = gtk::DragSource::new();
     drag_source.set_actions(DragAction::COPY);
     let state_drag_out = state.clone();
-    let tree_view_drag = tree_view.clone();
+    let selection_drag_out = selection_model.clone();
     drag_source.connect_prepare(move |_, _x: f64, _y: f64| -> Option<ContentProvider> {
-        let selection = tree_view_drag.selection();
-        let (selected_paths, model): (Vec<gtk::TreePath>, gtk::TreeModel) = selection.selected_rows();
-        if selected_paths.is_empty() { return None; }
-        
-        let iter = model.iter(&selected_paths[0]).unwrap();
-        let v_path: String = model.get_value(&iter, 2).get().unwrap();
-        
-        let s = state_drag_out.borrow();
-        if let Some(idx) = s.active_idx {
-            let temp_dir = std::env::temp_dir().join("farxplus_drag");
-            let _ = std::fs::create_dir_all(&temp_dir);
-            let mut selected_set = std::collections::HashSet::new();
-            selected_set.insert(v_path.clone());
-            
-            if s.archives[idx].extract_items(&selected_set, &temp_dir).is_ok() {
-                let extracted_file_path = temp_dir.join(&v_path);
-                use glib::prelude::ToValue;
-                return Some(ContentProvider::for_value(&gio::File::for_path(extracted_file_path).to_value()));
+        if let Some(obj) = get_selected_object(&selection_drag_out) {
+            let v_path = obj.v_path();
+            if let Ok(s) = state_drag_out.try_borrow() {
+                if let Some(idx) = s.active_idx {
+                    let temp_dir = std::env::temp_dir().join("farxplus_drag");
+                    let _ = std::fs::create_dir_all(&temp_dir);
+                    let mut selected_set = std::collections::HashSet::new();
+                    selected_set.insert(v_path.clone());
+                    
+                    if s.archives[idx].extract_items(&selected_set, &temp_dir).is_ok() {
+                        let extracted_file_path = temp_dir.join(&v_path);
+                        use glib::prelude::ToValue;
+                        return Some(ContentProvider::for_value(&gio::File::for_path(extracted_file_path).to_value()));
+                    }
+                }
             }
         }
         None
     });
-    tree_view.add_controller(drag_source);
+    column_view.add_controller(drag_source);
 
     window.present();
 }
