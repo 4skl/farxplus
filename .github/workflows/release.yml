@@ -5,9 +5,9 @@ on:
     tags:
       - 'v*'
 
-# Silence the Node 20 deprecation warnings globally
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+# FIX 1: Grant the GitHub Action permission to actually create the release
+permissions:
+  contents: write
 
 jobs:
   # -----------------------------------------------------------------
@@ -17,7 +17,7 @@ jobs:
     name: Build Native (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false # Prevent Windows from canceling if macOS fails (and vice versa)
+      fail-fast: false 
       matrix:
         include:
           - os: macos-14
@@ -32,7 +32,6 @@ jobs:
       # --- MACOS SETUP & BUNDLE ---
       - name: Install GTK4 & Dylibbundler (macOS)
         if: runner.os == 'macOS'
-        # FIXED: Changed macdylibbundler to dylibbundler
         run: |
           brew install gtk4 dylibbundler
           
@@ -47,10 +46,12 @@ jobs:
         with:
           msystem: UCRT64
           update: true
+          # FIX 2: Added pkgconf so Rust can find GTK4 on Windows
           install: >-
             mingw-w64-ucrt-x86_64-gtk4
             mingw-w64-ucrt-x86_64-rust
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
             zip
 
       # --- COMPILATION ---
@@ -96,7 +97,6 @@ jobs:
           EOF
           
           dylibbundler -od -b -x FARxPlus.app/Contents/MacOS/FARxPlus -d FARxPlus.app/Contents/Frameworks/ -p @executable_path/../Frameworks/
-          
           zip -r ${{ matrix.artifact_name }} FARxPlus.app
 
       # --- WINDOWS PACKAGING ---
@@ -118,7 +118,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-
   # -----------------------------------------------------------------
   # JOB 2: BUILD LINUX FLATPAK
   # -----------------------------------------------------------------
@@ -138,7 +137,10 @@ jobs:
         run: |
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           flatpak install --user -y flathub org.gnome.Sdk//46 org.gnome.Platform//46
+          # Explicitly install the Rust extension so the builder doesn't panic
+          flatpak install --user -y flathub org.freedesktop.Sdk.Extension.rust-stable//23.08
 
+      # FIX 3: Re-structured Flatpak Manifest for proper Rust execution
       - name: Generate Flatpak Manifest
         run: |
           cat <<EOF > com.az.FARxPlus.json
@@ -148,18 +150,23 @@ jobs:
             "runtime-version": "46",
             "sdk": "org.gnome.Sdk",
             "command": "FARxPlus",
-            "build-options": {
-              "build-args": ["--share=network"]
-            },
             "sdk-extensions": [
               "org.freedesktop.Sdk.Extension.rust-stable"
             ],
+            "build-options": {
+              "append-path": "/usr/lib/sdk/rust-stable/bin",
+              "env": {
+                "CARGO_HOME": "/run/build/FARxPlus/cargo"
+              }
+            },
             "modules": [
               {
                 "name": "FARxPlus",
                 "buildsystem": "simple",
+                "build-options": {
+                  "build-args": ["--share=network"]
+                },
                 "build-commands": [
-                  ". /usr/lib/sdk/rust-stable/enable",
                   "cargo build --release",
                   "install -Dm755 target/release/FARxPlus /app/bin/FARxPlus"
                 ],
@@ -176,7 +183,6 @@ jobs:
 
       - name: Build Flatpak Bundle
         run: |
-          # FIXED: Added --disable-rofiles-fuse to prevent the CI runner from crashing
           flatpak-builder --user --disable-rofiles-fuse --install-deps-from=flathub --repo=repo --force-clean build-dir com.az.FARxPlus.json
           flatpak build-bundle repo FARxPlus-linux-amd64.flatpak com.az.FARxPlus
 
