@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
 
+# Silence the Node 20 deprecation warnings globally
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   # -----------------------------------------------------------------
   # JOB 1: BUILD WINDOWS & MACOS (.app bundle wrapped in a ZIP)
@@ -13,9 +17,10 @@ jobs:
     name: Build Native (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false # Prevent Windows from canceling if macOS fails (and vice versa)
       matrix:
         include:
-          - os: macos-14 # Apple Silicon (M-series) runner
+          - os: macos-14
             artifact_name: FARxPlus-macos-arm64.zip
           - os: windows-latest
             artifact_name: FARxPlus-windows-amd64.zip
@@ -27,8 +32,9 @@ jobs:
       # --- MACOS SETUP & BUNDLE ---
       - name: Install GTK4 & Dylibbundler (macOS)
         if: runner.os == 'macOS'
+        # FIXED: Changed macdylibbundler to dylibbundler
         run: |
-          brew install gtk4 macdylibbundler
+          brew install gtk4 dylibbundler
           
       - name: Install Rust (macOS)
         if: runner.os == 'macOS'
@@ -61,16 +67,13 @@ jobs:
       - name: Package macOS .app Bundle
         if: runner.os == 'macOS'
         run: |
-          # 1. Structure the App Bundle directory
           mkdir -p FARxPlus.app/Contents/MacOS
           mkdir -p FARxPlus.app/Contents/Resources
           mkdir -p FARxPlus.app/Contents/Frameworks
           
-          # 2. Copy compiled binary and app asset icon
           cp target/release/FARxPlus FARxPlus.app/Contents/MacOS/FARxPlus
           if [ -d "assets" ]; then cp -r assets FARxPlus.app/Contents/Resources/; fi
           
-          # 3. Create basic Info.plist
           cat <<EOF > FARxPlus.app/Contents/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -92,11 +95,8 @@ jobs:
           </plist>
           EOF
           
-          # 4. Inject GTK .dylib files into the bundle and fix linkage paths
-          # This makes the app standalone so users don't need homebrew installed!
           dylibbundler -od -b -x FARxPlus.app/Contents/MacOS/FARxPlus -d FARxPlus.app/Contents/Frameworks/ -p @executable_path/../Frameworks/
           
-          # 5. Compress into ZIP file
           zip -r ${{ matrix.artifact_name }} FARxPlus.app
 
       # --- WINDOWS PACKAGING ---
@@ -139,8 +139,6 @@ jobs:
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           flatpak install --user -y flathub org.gnome.Sdk//46 org.gnome.Platform//46
 
-      # Generate Flatpak Manifest file dynamically
-      # Uses the GNOME 46 runtime environment which natively includes GTK4
       - name: Generate Flatpak Manifest
         run: |
           cat <<EOF > com.az.FARxPlus.json
@@ -178,7 +176,8 @@ jobs:
 
       - name: Build Flatpak Bundle
         run: |
-          flatpak-builder --user --install-deps-from=flathub --repo=repo --force-clean build-dir com.az.FARxPlus.json
+          # FIXED: Added --disable-rofiles-fuse to prevent the CI runner from crashing
+          flatpak-builder --user --disable-rofiles-fuse --install-deps-from=flathub --repo=repo --force-clean build-dir com.az.FARxPlus.json
           flatpak build-bundle repo FARxPlus-linux-amd64.flatpak com.az.FARxPlus
 
       # --- UPLOAD FLATPAK ASSET ---
