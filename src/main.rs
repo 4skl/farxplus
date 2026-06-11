@@ -12,6 +12,10 @@ use gtk::prelude::*;
 use gio::ApplicationFlags;
 
 fn main() -> glib::ExitCode {
+    // Set global app name for the OS taskbars, docks, and about dialogs
+    gtk::glib::set_application_name("FARxPlus");
+    gtk::glib::set_prgname(Some("FARxPlus"));
+
     let cli_args = Cli::parse();
 
     // Route 1: Command Line Interface
