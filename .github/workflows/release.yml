@@ -1,0 +1,190 @@
+name: Build and Release v0.1.0
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # -----------------------------------------------------------------
+  # JOB 1: BUILD WINDOWS & MACOS (.app bundle wrapped in a ZIP)
+  # -----------------------------------------------------------------
+  build-native:
+    name: Build Native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-14 # Apple Silicon (M-series) runner
+            artifact_name: FARxPlus-macos-arm64.zip
+          - os: windows-latest
+            artifact_name: FARxPlus-windows-amd64.zip
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      # --- MACOS SETUP & BUNDLE ---
+      - name: Install GTK4 & Dylibbundler (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install gtk4 macdylibbundler
+          
+      - name: Install Rust (macOS)
+        if: runner.os == 'macOS'
+        uses: dtolnay/rust-toolchain@stable
+
+      # --- WINDOWS SETUP ---
+      - name: Setup MSYS2 and GTK4 (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-gcc
+            zip
+
+      # --- COMPILATION ---
+      - name: Build Release Binary (macOS)
+        if: runner.os == 'macOS'
+        run: cargo build --release
+
+      - name: Build Release Binary (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: cargo build --release
+
+      # --- MACOS PACKAGING (.app Bundle) ---
+      - name: Package macOS .app Bundle
+        if: runner.os == 'macOS'
+        run: |
+          # 1. Structure the App Bundle directory
+          mkdir -p FARxPlus.app/Contents/MacOS
+          mkdir -p FARxPlus.app/Contents/Resources
+          mkdir -p FARxPlus.app/Contents/Frameworks
+          
+          # 2. Copy compiled binary and app asset icon
+          cp target/release/FARxPlus FARxPlus.app/Contents/MacOS/FARxPlus
+          if [ -d "assets" ]; then cp -r assets FARxPlus.app/Contents/Resources/; fi
+          
+          # 3. Create basic Info.plist
+          cat <<EOF > FARxPlus.app/Contents/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>FARxPlus</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.az.farxplus</string>
+              <key>CFBundleName</key>
+              <string>FARxPlus</string>
+              <key>CFBundleVersion</key>
+              <string>0.1.0</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>0.1.0</string>
+          </dict>
+          </plist>
+          EOF
+          
+          # 4. Inject GTK .dylib files into the bundle and fix linkage paths
+          # This makes the app standalone so users don't need homebrew installed!
+          dylibbundler -od -b -x FARxPlus.app/Contents/MacOS/FARxPlus -d FARxPlus.app/Contents/Frameworks/ -p @executable_path/../Frameworks/
+          
+          # 5. Compress into ZIP file
+          zip -r ${{ matrix.artifact_name }} FARxPlus.app
+
+      # --- WINDOWS PACKAGING ---
+      - name: Bundle Windows DLLs into ZIP
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          mkdir FARxPlus-Windows
+          cp target/release/FARxPlus.exe FARxPlus-Windows/FARxPlus.exe
+          if [ -d "assets" ]; then cp -r assets FARxPlus-Windows/; fi
+          ldd target/release/FARxPlus.exe | grep '\/ucrt64.*\.dll' -o | xargs -I{} cp "{}" FARxPlus-Windows/
+          zip -r ${{ matrix.artifact_name }} FARxPlus-Windows/
+
+      # --- UPLOAD NATIVE ASSETS ---
+      - name: Upload Native Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+  # -----------------------------------------------------------------
+  # JOB 2: BUILD LINUX FLATPAK
+  # -----------------------------------------------------------------
+  build-flatpak:
+    name: Build Linux Flatpak
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Install Flatpak Builder Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+
+      - name: Set up Flathub Runtimes
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub org.gnome.Sdk//46 org.gnome.Platform//46
+
+      # Generate Flatpak Manifest file dynamically
+      # Uses the GNOME 46 runtime environment which natively includes GTK4
+      - name: Generate Flatpak Manifest
+        run: |
+          cat <<EOF > com.az.FARxPlus.json
+          {
+            "app-id": "com.az.FARxPlus",
+            "runtime": "org.gnome.Platform",
+            "runtime-version": "46",
+            "sdk": "org.gnome.Sdk",
+            "command": "FARxPlus",
+            "build-options": {
+              "build-args": ["--share=network"]
+            },
+            "sdk-extensions": [
+              "org.freedesktop.Sdk.Extension.rust-stable"
+            ],
+            "modules": [
+              {
+                "name": "FARxPlus",
+                "buildsystem": "simple",
+                "build-commands": [
+                  ". /usr/lib/sdk/rust-stable/enable",
+                  "cargo build --release",
+                  "install -Dm755 target/release/FARxPlus /app/bin/FARxPlus"
+                ],
+                "sources": [
+                  {
+                    "type": "dir",
+                    "path": "."
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+
+      - name: Build Flatpak Bundle
+        run: |
+          flatpak-builder --user --install-deps-from=flathub --repo=repo --force-clean build-dir com.az.FARxPlus.json
+          flatpak build-bundle repo FARxPlus-linux-amd64.flatpak com.az.FARxPlus
+
+      # --- UPLOAD FLATPAK ASSET ---
+      - name: Upload Flatpak Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: FARxPlus-linux-amd64.flatpak
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
