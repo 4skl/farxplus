@@ -9,6 +9,7 @@ use gtk::{
     ScrolledWindow, Label, SelectionMode, Separator, SearchEntry
 };
 use gdk::{DragAction, FileList, ContentProvider};
+use gtk::glib;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::path::PathBuf;
@@ -208,8 +209,14 @@ pub fn build_ui(app: &Application) {
     window.set_titlebar(Some(&header_bar));
 
     let btn_new = Button::with_label("New Archive");
+    btn_new.set_tooltip_text(Some("Create New Archive (Ctrl+N)"));
+    
     let btn_open = Button::with_label("Open...");
+    btn_open.set_tooltip_text(Some("Open Existing Archive (Ctrl+O)"));
+    
     let btn_save = Button::with_label("Save As...");
+    btn_save.set_tooltip_text(Some("Save Current Archive (Ctrl+S)"));
+    
     header_bar.pack_start(&btn_new);
     header_bar.pack_start(&btn_open);
     header_bar.pack_end(&btn_save);
@@ -228,6 +235,7 @@ pub fn build_ui(app: &Application) {
     left_vbox.append(&left_scroll);
     
     let btn_close_archive = Button::with_label("Close Active Archive");
+    btn_close_archive.set_tooltip_text(Some("Close Selected Archive (Ctrl+W)"));
     btn_close_archive.set_margin_top(5);
     btn_close_archive.set_margin_bottom(5);
     btn_close_archive.set_margin_start(5);
@@ -246,8 +254,13 @@ pub fn build_ui(app: &Application) {
     let btn_extract = Button::with_label("📥 Extract Selected");
     let btn_add_files = Button::with_label("➕ Add Files");
     let btn_add_folder = Button::with_label("📁 Add Folder");
+    
     let btn_rename = Button::with_label("✏️ Rename"); 
+    btn_rename.set_tooltip_text(Some("Rename Item (F2)"));
+    
     let btn_delete = Button::with_label("🗑 Delete");
+    btn_delete.set_tooltip_text(Some("Delete Item (Del)"));
+
     toolbar.append(&btn_extract);
     toolbar.append(&btn_add_files);
     toolbar.append(&btn_add_folder);
@@ -258,6 +271,7 @@ pub fn build_ui(app: &Application) {
 
     let search_bar = SearchEntry::new();
     search_bar.set_placeholder_text(Some("Search files..."));
+    search_bar.set_tooltip_text(Some("Search (Ctrl+F)"));
     search_bar.set_margin_start(5);
     search_bar.set_margin_end(5);
     search_bar.set_margin_bottom(5);
@@ -286,17 +300,12 @@ pub fn build_ui(app: &Application) {
     factory_name.connect_setup(|_, obj| {
         let list_item = obj.downcast_ref::<gtk::ListItem>().unwrap();
         let expander = gtk::TreeExpander::new();
-        let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 6); // 6px gap between icon and text
-        
-        // UX FIX: Add vertical padding to make the row taller. 
-        // A taller row forces the expander arrow to generate a much larger, easier-to-click hitbox!
+        let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 6); 
         box_.set_margin_top(4);
         box_.set_margin_bottom(4);
 
         let icon_label = gtk::Label::new(None);
         let name_label = gtk::Label::new(None);
-        
-        // Prevent extremely long file names from stretching the window horizontally
         name_label.set_ellipsize(gtk::pango::EllipsizeMode::End); 
         
         box_.append(&icon_label);
@@ -343,7 +352,6 @@ pub fn build_ui(app: &Application) {
     let col_size = gtk::ColumnViewColumn::new(Some("Size"), Some(factory_size));
     column_view.append_column(&col_size);
 
-    // HEIGHT FIX: Add .vexpand(true) so the window stretches to fill the screen
     let right_scroll = ScrolledWindow::builder()
         .child(&column_view)
         .vexpand(true) 
@@ -360,6 +368,31 @@ pub fn build_ui(app: &Application) {
     // ==========================================
     // ============ SIGNAL HANDLERS =============
     // ==========================================
+
+    // Key Event Controller for Shortcuts
+    let key_ctrl = gtk::EventControllerKey::new();
+    let btn_open_sc = btn_open.clone();
+    let btn_save_sc = btn_save.clone();
+    let btn_new_sc = btn_new.clone();
+    let btn_close_sc = btn_close_archive.clone();
+    let search_bar_sc = search_bar.clone();
+    let btn_delete_sc = btn_delete.clone();
+    let btn_rename_sc = btn_rename.clone();
+
+    key_ctrl.connect_key_pressed(move |_, key, _keycode, modifier| {
+        let is_ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
+        match key {
+            gdk::Key::o | gdk::Key::O if is_ctrl => { btn_open_sc.emit_clicked(); glib::Propagation::Stop }
+            gdk::Key::s | gdk::Key::S if is_ctrl => { btn_save_sc.emit_clicked(); glib::Propagation::Stop }
+            gdk::Key::n | gdk::Key::N if is_ctrl => { btn_new_sc.emit_clicked(); glib::Propagation::Stop }
+            gdk::Key::w | gdk::Key::W if is_ctrl => { btn_close_sc.emit_clicked(); glib::Propagation::Stop }
+            gdk::Key::f | gdk::Key::F if is_ctrl => { search_bar_sc.grab_focus(); glib::Propagation::Stop }
+            gdk::Key::Delete => { btn_delete_sc.emit_clicked(); glib::Propagation::Stop }
+            gdk::Key::F2 => { btn_rename_sc.emit_clicked(); glib::Propagation::Stop }
+            _ => glib::Propagation::Proceed,
+        }
+    });
+    window.add_controller(key_ctrl);
 
     column_view.connect_activate(|view, position| {
         let selection = view.model().unwrap().downcast::<gtk::SingleSelection>().unwrap();

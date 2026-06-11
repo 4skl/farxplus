@@ -60,6 +60,37 @@ fn main() -> glib::ExitCode {
                 }
                 println!("✅ Packing complete!");
             }
+            Commands::List { input } => {
+                println!("📋 Listing contents of: {:?}", input);
+                match FarArchive::open(&input) {
+                    Ok(archive) => {
+                        let mut stack = vec![(&archive.tree_root, String::new())];
+                        let mut count = 0;
+                        let mut total_size = 0;
+
+                        while let Some((node, path)) = stack.pop() {
+                            if !node.is_dir {
+                                let size = node.source.as_ref().map(|s| s.size()).unwrap_or(0);
+                                println!("- {} ({} bytes)", path, size);
+                                count += 1;
+                                total_size += size;
+                            }
+                            // Process in reverse so they pop off the stack in alphabetical order
+                            for (name, child) in node.children.iter().rev() {
+                                let child_path = if path.is_empty() { name.clone() } else { format!("{}/{}", path, name) };
+                                stack.push((child, child_path));
+                            }
+                        }
+                        println!("-------------------");
+                        println!("Total files: {}", count);
+                        println!("Total decompressed size: {} bytes", total_size);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Failed to open archive: {}", e);
+                        process::exit(1);
+                    }
+                }
+            }
         }
         return glib::ExitCode::SUCCESS;
     }

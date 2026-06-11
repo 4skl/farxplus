@@ -24,4 +24,9 @@ pub enum Commands {
         #[arg(short, long)]
         output: PathBuf,
     },
+    /// List the contents of a .far archive
+    List {
+        #[arg(short, long)]
+        input: PathBuf,
+    },
 }
