@@ -11,3 +11,12 @@ gtk4 = { version = "0.9", features = ["v4_10"] }
 gdk4 = { version = "0.9", features = ["v4_10"] }
 glib = "0.20"
 gio = "0.20"
+
+[build-dependencies]
+embed-resource = "2.4"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1

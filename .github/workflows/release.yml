@@ -5,13 +5,12 @@ on:
     tags:
       - 'v*'
 
-# FIX 1: Grant the GitHub Action permission to actually create the release
 permissions:
   contents: write
 
 jobs:
   # -----------------------------------------------------------------
-  # JOB 1: BUILD WINDOWS & MACOS (.app bundle wrapped in a ZIP)
+  # JOB 1: BUILD WINDOWS & MACOS
   # -----------------------------------------------------------------
   build-native:
     name: Build Native (${{ matrix.os }})
@@ -29,15 +28,17 @@ jobs:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
+      # --- RUST SETUP & CACHE ---
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
       # --- MACOS SETUP & BUNDLE ---
       - name: Install GTK4 & Dylibbundler (macOS)
         if: runner.os == 'macOS'
-        run: |
-          brew install gtk4 dylibbundler
-          
-      - name: Install Rust (macOS)
-        if: runner.os == 'macOS'
-        uses: dtolnay/rust-toolchain@stable
+        run: brew install gtk4 dylibbundler
 
       # --- WINDOWS SETUP ---
       - name: Setup MSYS2 and GTK4 (Windows)
@@ -46,7 +47,6 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          # FIX 2: Added pkgconf so Rust can find GTK4 on Windows
           install: >-
             mingw-w64-ucrt-x86_64-gtk4
             mingw-w64-ucrt-x86_64-rust
@@ -73,7 +73,7 @@ jobs:
           mkdir -p FARxPlus.app/Contents/Frameworks
           
           cp target/release/FARxPlus FARxPlus.app/Contents/MacOS/FARxPlus
-          if [ -d "assets" ]; then cp -r assets FARxPlus.app/Contents/Resources/; fi
+          if [ -d "assets" ]; then cp -r assets/* FARxPlus.app/Contents/Resources/; fi
           
           cat <<EOF > FARxPlus.app/Contents/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
@@ -83,7 +83,7 @@ jobs:
               <key>CFBundleExecutable</key>
               <string>FARxPlus</string>
               <key>CFBundleIdentifier</key>
-              <string>com.az.farxplus</string>
+              <string>com.fourskl.farxplus</string>
               <key>CFBundleName</key>
               <string>FARxPlus</string>
               <key>CFBundleVersion</key>
@@ -92,6 +92,8 @@ jobs:
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
               <string>0.1.0</string>
+              <key>CFBundleIconFile</key>
+              <string>AppIcon.icns</string>
           </dict>
           </plist>
           EOF
@@ -110,86 +112,99 @@ jobs:
           ldd target/release/FARxPlus.exe | grep '\/ucrt64.*\.dll' -o | xargs -I{} cp "{}" FARxPlus-Windows/
           zip -r ${{ matrix.artifact_name }} FARxPlus-Windows/
 
-      # --- UPLOAD NATIVE ASSETS ---
-      - name: Upload Native Release Asset
-        uses: softprops/action-gh-release@v2
+      # --- UPLOAD ARTIFACTS FOR STAGING ---
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: ${{ matrix.artifact_name }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
 
   # -----------------------------------------------------------------
-  # JOB 2: BUILD LINUX FLATPAK
+  # JOB 2: BUILD LINUX APPIMAGE (Standalone)
   # -----------------------------------------------------------------
-  build-flatpak:
-    name: Build Linux Flatpak
-    runs-on: ubuntu-latest
+  build-appimage:
+    name: Build Linux AppImage
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Install Flatpak Builder Dependencies
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y flatpak flatpak-builder
+          sudo apt-get install -y libgtk-4-dev build-essential file
 
-      - name: Set up Flathub Runtimes
-        run: |
-          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-          # BUMPED to GNOME 47
-          flatpak install --user -y flathub org.gnome.Sdk//47 org.gnome.Platform//47
-          # BUMPED to the 24.08 Rust extension to support Edition 2024
-          flatpak install --user -y flathub org.freedesktop.Sdk.Extension.rust-stable//24.08
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Generate Flatpak Manifest
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Release Binary
+        run: cargo build --release
+
+      - name: Setup AppDir Structure
         run: |
-          cat <<EOF > com.az.FARxPlus.json
-          {
-            "app-id": "com.az.FARxPlus",
-            "runtime": "org.gnome.Platform",
-            "runtime-version": "47", 
-            "sdk": "org.gnome.Sdk",
-            "command": "FARxPlus",
-            "sdk-extensions": [
-              "org.freedesktop.Sdk.Extension.rust-stable"
-            ],
-            "build-options": {
-              "append-path": "/usr/lib/sdk/rust-stable/bin",
-              "env": {
-                "CARGO_HOME": "/run/build/FARxPlus/cargo"
-              }
-            },
-            "modules": [
-              {
-                "name": "FARxPlus",
-                "buildsystem": "simple",
-                "build-options": {
-                  "build-args": ["--share=network"]
-                },
-                "build-commands": [
-                  "cargo build --release",
-                  "install -Dm755 target/release/FARxPlus /app/bin/FARxPlus"
-                ],
-                "sources": [
-                  {
-                    "type": "dir",
-                    "path": "."
-                  }
-                ]
-              }
-            ]
-          }
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/scalable/apps
+          
+          # Copy Binary
+          cp target/release/FARxPlus AppDir/usr/bin/FARxPlus
+          
+          # Copy Linux Icon (Assuming you have an SVG in assets)
+          if [ -f "assets/icon.svg" ]; then 
+            cp assets/icon.svg AppDir/usr/share/icons/hicolor/scalable/apps/com.fourskl.farxplus.svg
+          fi
+          
+          # Create Desktop File
+          cat <<EOF > AppDir/usr/share/applications/com.fourskl.farxplus.desktop
+          [Desktop Entry]
+          Name=FARxPlus
+          Comment=Manage .far archives easily
+          Exec=FARxPlus
+          Icon=com.fourskl.farxplus
+          Terminal=false
+          Type=Application
+          Categories=Utility;Archiving;
           EOF
 
-      - name: Build Flatpak Bundle
+      - name: Package AppImage
+        env:
+          OUTPUT: FARxPlus-linux-amd64.AppImage
         run: |
-          flatpak-builder --user --disable-rofiles-fuse --install-deps-from=flathub --repo=repo --force-clean build-dir com.az.FARxPlus.json
-          flatpak build-bundle repo FARxPlus-linux-amd64.flatpak com.az.FARxPlus
+          # Download linuxdeploy and GTK plugin
+          wget -c -nv "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
+          wget -c -nv "https://github.com/linuxdeploy/linuxdeploy-plugin-gtk/releases/download/continuous/linuxdeploy-plugin-gtk.sh"
+          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-gtk.sh
+          
+          # Run linuxdeploy
+          export UPD_INFO="gh-releases-zsync|az|FARxPlus|latest|FARxPlus-linux-amd64.AppImage.zsync"
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --plugin gtk --output appimage
 
-      # --- UPLOAD FLATPAK ASSET ---
-      - name: Upload Flatpak Release Asset
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FARxPlus-linux-amd64.AppImage
+          path: FARxPlus-linux-amd64.AppImage
+
+  # -----------------------------------------------------------------
+  # JOB 3: PUBLISH RELEASE
+  # -----------------------------------------------------------------
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-native, build-appimage]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all workflow run artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          files: FARxPlus-linux-amd64.flatpak
+          files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
