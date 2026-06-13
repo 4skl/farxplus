@@ -124,7 +124,7 @@ jobs:
   # -----------------------------------------------------------------
   build-appimage:
     name: Build Linux AppImage
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
