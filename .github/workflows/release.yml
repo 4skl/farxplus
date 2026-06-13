@@ -175,7 +175,7 @@ jobs:
         run: |
           # Download linuxdeploy and GTK plugin
           wget -c -nv "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
-          wget -c -nv "https://github.com/linuxdeploy/linuxdeploy-plugin-gtk/releases/download/continuous/linuxdeploy-plugin-gtk.sh"
+          wget -c -nv "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh"
           chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-gtk.sh
           
           # Run linuxdeploy
